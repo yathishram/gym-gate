@@ -1,0 +1,721 @@
+#!/bin/bash
+
+# gym-gate: A CLI tool that blocks git commits until you've worked out
+# Uses Apple Health Exercise Minutes via iOS Shortcut sync
+
+set -e
+
+VERSION="1.1.0"
+CONFIG_DIR="$HOME/.config/gym-gate"
+SYNCED_FILE="$CONFIG_DIR/workouts.txt"
+MANUAL_LOG="$CONFIG_DIR/manual-log.txt"
+THRESHOLD_FILE="$CONFIG_DIR/threshold"
+HOOK_TEMPLATE_DIR="$CONFIG_DIR/hooks"
+GIT_HOOKS_DIR="$HOME/.config/git/hooks"
+DEFAULT_THRESHOLD=15
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
+
+# Emojis
+MUSCLE="💪"
+NO_ENTRY="🚫"
+SHAME="😔"
+FIRE="🔥"
+CHECK="✅"
+CALENDAR="📅"
+GEAR="⚙️"
+TRASH="🗑️"
+CLOCK="⏱️"
+
+print_banner() {
+    echo -e "${PURPLE}"
+    echo '   ____                  ____       _       '
+    echo '  / ___| _   _ _ __ ___ / ___| __ _| |_ ___ '
+    echo ' | |  _ | | | |  _ ` _ \| |  _ / _` | __/ _ \'
+    echo ' | |_| || |_| | | | | | | |_| | (_| | ||  __/'
+    echo '  \____| \__, |_| |_| |_|\____|\__,_|\__\___|'
+    echo '         |___/                               '
+    echo -e "${NC}"
+    echo -e "${BOLD}No workout, no commit.${NC} v${VERSION}"
+    echo ""
+}
+
+ensure_config_dir() {
+    mkdir -p "$CONFIG_DIR"
+    mkdir -p "$HOOK_TEMPLATE_DIR"
+    mkdir -p "$GIT_HOOKS_DIR"
+    
+    # Initialize manual log if it doesn't exist
+    if [ ! -f "$MANUAL_LOG" ]; then
+        touch "$MANUAL_LOG"
+    fi
+    
+    # Initialize threshold if it doesn't exist
+    if [ ! -f "$THRESHOLD_FILE" ]; then
+        echo "$DEFAULT_THRESHOLD" > "$THRESHOLD_FILE"
+    fi
+}
+
+get_threshold() {
+    if [ -f "$THRESHOLD_FILE" ]; then
+        cat "$THRESHOLD_FILE"
+    else
+        echo "$DEFAULT_THRESHOLD"
+    fi
+}
+
+create_pre_commit_hook() {
+    cat << 'HOOK_EOF'
+#!/bin/bash
+
+# gym-gate pre-commit hook
+# Blocks commits if you haven't worked out today
+
+CONFIG_DIR="$HOME/.config/gym-gate"
+SYNCED_FILE="$CONFIG_DIR/workouts.txt"
+MANUAL_LOG="$CONFIG_DIR/manual-log.txt"
+THRESHOLD_FILE="$CONFIG_DIR/threshold"
+TODAY=$(date +%Y-%m-%d)
+DEFAULT_THRESHOLD=15
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+get_threshold() {
+    if [ -f "$THRESHOLD_FILE" ]; then
+        cat "$THRESHOLD_FILE"
+    else
+        echo "$DEFAULT_THRESHOLD"
+    fi
+}
+
+check_workout_logged() {
+    # Check manual log first (manual log = always counts)
+    if grep -q "^$TODAY" "$MANUAL_LOG" 2>/dev/null && ! grep -q "^$TODAY.*SKIPPED" "$MANUAL_LOG" 2>/dev/null; then
+        return 0
+    fi
+    
+    # Check synced workouts file (from iOS Shortcut)
+    # Format: 2024-01-15|Exercise|32 min
+    if [ -f "$SYNCED_FILE" ]; then
+        if grep -q "^$TODAY" "$SYNCED_FILE" 2>/dev/null; then
+            # File exists and has today's date = shortcut already validated threshold
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+get_todays_workout() {
+    # Try to get workout details for display
+    if [ -f "$SYNCED_FILE" ] && grep -q "^$TODAY" "$SYNCED_FILE" 2>/dev/null; then
+        local line=$(grep "^$TODAY" "$SYNCED_FILE" | head -1)
+        local type=$(echo "$line" | cut -d'|' -f2)
+        local duration=$(echo "$line" | cut -d'|' -f3)
+        echo "$type - $duration"
+    elif grep -q "^$TODAY" "$MANUAL_LOG" 2>/dev/null; then
+        grep "^$TODAY" "$MANUAL_LOG" | head -1 | cut -d'-' -f2- | xargs
+    fi
+}
+
+# Check if gym-gate is disabled
+if [ -f "$CONFIG_DIR/disabled" ]; then
+    exit 0
+fi
+
+# Check if bypass mode is active (temporary skip)
+if [ -f "$CONFIG_DIR/bypass" ]; then
+    BYPASS_TIME=$(cat "$CONFIG_DIR/bypass")
+    CURRENT_TIME=$(date +%s)
+    if [ "$CURRENT_TIME" -lt "$BYPASS_TIME" ]; then
+        echo -e "${YELLOW}⏭️  Gym-gate bypassed (rest day mode)${NC}"
+        exit 0
+    else
+        rm -f "$CONFIG_DIR/bypass"
+    fi
+fi
+
+if check_workout_logged; then
+    WORKOUT_INFO=$(get_todays_workout)
+    if [ -n "$WORKOUT_INFO" ]; then
+        echo -e "${GREEN}💪 Workout logged: ${CYAN}${WORKOUT_INFO}${GREEN}. Commit approved!${NC}"
+    else
+        echo -e "${GREEN}💪 Workout logged for today. Commit approved!${NC}"
+    fi
+    exit 0
+fi
+
+# No workout logged
+THRESHOLD=$(get_threshold)
+echo ""
+echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${RED}║  🚫  GYM-GATE: NO WORKOUT LOGGED FOR TODAY                   ║${NC}"
+echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  ${YELLOW}Minimum required: ${THRESHOLD} minutes of exercise${NC}"
+echo ""
+echo -e "  ${YELLOW}Options:${NC}"
+echo -e "  1. Work out for ${THRESHOLD}+ minutes, then run your iOS Shortcut"
+echo -e "  2. Manual override: ${GREEN}gym-gate log \"your workout\"${NC}"
+echo -e "  3. Rest day: ${GREEN}gym-gate bypass${NC} (skips for 1 hour)"
+echo -e "  4. To commit anyway, type exactly:"
+echo ""
+echo -e "     ${RED}I SKIPPED THE GYM TODAY${NC}"
+echo ""
+
+read -p "  > " confession
+
+if [ "$confession" = "I SKIPPED THE GYM TODAY" ]; then
+    echo ""
+    echo -e "${YELLOW}😔 Shame noted. Commit allowed (this time).${NC}"
+    echo -e "${YELLOW}   Your streak has been broken.${NC}"
+    echo ""
+    
+    # Log the skip
+    echo "$TODAY SKIPPED - commit confession" >> "$MANUAL_LOG"
+    exit 0
+fi
+
+echo ""
+echo -e "${RED}❌ Commit rejected. Go work out!${NC}"
+echo ""
+exit 1
+HOOK_EOF
+}
+
+install_hooks() {
+    echo -e "${GEAR} Installing gym-gate globally..."
+    echo ""
+    
+    ensure_config_dir
+    
+    # Create the hook script
+    create_pre_commit_hook > "$HOOK_TEMPLATE_DIR/pre-commit"
+    chmod +x "$HOOK_TEMPLATE_DIR/pre-commit"
+    
+    # Copy to git hooks directory
+    cp "$HOOK_TEMPLATE_DIR/pre-commit" "$GIT_HOOKS_DIR/pre-commit"
+    chmod +x "$GIT_HOOKS_DIR/pre-commit"
+    
+    # Configure git to use the hooks directory
+    git config --global core.hooksPath "$GIT_HOOKS_DIR"
+    
+    local threshold=$(get_threshold)
+    
+    echo -e "${CHECK} Global git hooks directory set to: ${BLUE}$GIT_HOOKS_DIR${NC}"
+    echo -e "${CHECK} Pre-commit hook installed"
+    echo -e "${CHECK} Minimum exercise threshold: ${CYAN}${threshold} minutes${NC}"
+    echo ""
+    echo -e "${GREEN}${MUSCLE} Gym-gate is now active!${NC}"
+    echo ""
+    echo -e "${BOLD}Next steps:${NC}"
+    echo -e "  1. Set up Apple Health sync:"
+    echo -e "     ${BLUE}gym-gate setup-health${NC}"
+    echo ""
+    echo -e "  2. Or manually log workouts:"
+    echo -e "     ${BLUE}gym-gate log \"30 min run\"${NC}"
+    echo ""
+}
+
+uninstall_hooks() {
+    echo -e "${TRASH} Uninstalling gym-gate..."
+    echo ""
+    
+    # Remove the hook
+    if [ -f "$GIT_HOOKS_DIR/pre-commit" ]; then
+        rm "$GIT_HOOKS_DIR/pre-commit"
+        echo -e "${CHECK} Removed pre-commit hook"
+    fi
+    
+    # Reset git hooks path if our directory is empty
+    if [ -z "$(ls -A $GIT_HOOKS_DIR 2>/dev/null)" ]; then
+        git config --global --unset core.hooksPath 2>/dev/null || true
+        echo -e "${CHECK} Reset global hooks path"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}Gym-gate has been uninstalled.${NC}"
+    echo -e "Your config and workout history are preserved in: ${BLUE}$CONFIG_DIR${NC}"
+    echo -e "To remove all data: ${BLUE}rm -rf $CONFIG_DIR${NC}"
+    echo ""
+}
+
+log_workout() {
+    ensure_config_dir
+    
+    local workout_desc="$*"
+    local today=$(date +%Y-%m-%d)
+    local time=$(date +%H:%M)
+    
+    if [ -z "$workout_desc" ]; then
+        workout_desc="Workout"
+    fi
+    
+    echo "$today $time - $workout_desc" >> "$MANUAL_LOG"
+    
+    echo ""
+    echo -e "${MUSCLE} ${GREEN}Workout logged!${NC}"
+    echo -e "   ${CALENDAR} Date: $today"
+    echo -e "   ${FIRE} Activity: $workout_desc"
+    echo ""
+    echo -e "You're clear to commit. Get after it! ${FIRE}"
+    echo ""
+}
+
+set_threshold() {
+    ensure_config_dir
+    
+    local new_threshold="$1"
+    
+    if [ -z "$new_threshold" ]; then
+        echo -e "${RED}Usage: gym-gate set-threshold <minutes>${NC}"
+        echo "Example: gym-gate set-threshold 20"
+        return 1
+    fi
+    
+    # Validate it's a number
+    if ! [[ "$new_threshold" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Error: Threshold must be a number${NC}"
+        return 1
+    fi
+    
+    echo "$new_threshold" > "$THRESHOLD_FILE"
+    
+    echo ""
+    echo -e "${CHECK} ${GREEN}Threshold updated!${NC}"
+    echo -e "   ${CLOCK} New minimum: ${CYAN}$new_threshold minutes${NC} of exercise"
+    echo ""
+    echo -e "${YELLOW}Note:${NC} The iOS Shortcut also has a threshold check."
+    echo "Make sure to update it to match if needed."
+    echo ""
+}
+
+show_status() {
+    ensure_config_dir
+    
+    local today=$(date +%Y-%m-%d)
+    local worked_out=false
+    local streak=0
+    local workout_info=""
+    local threshold=$(get_threshold)
+    
+    echo ""
+    echo -e "${BOLD}Gym-Gate Status${NC}"
+    echo -e "─────────────────────────────────"
+    
+    # Check if disabled
+    if [ -f "$CONFIG_DIR/disabled" ]; then
+        echo -e "Status:    ${YELLOW}DISABLED${NC}"
+    else
+        echo -e "Status:    ${GREEN}ACTIVE${NC}"
+    fi
+    
+    echo -e "Threshold: ${CYAN}$threshold minutes${NC}"
+    
+    # Check today's workout - manual log
+    if grep -q "^$today" "$MANUAL_LOG" 2>/dev/null && ! grep -q "^$today.*SKIPPED" "$MANUAL_LOG" 2>/dev/null; then
+        worked_out=true
+        workout_info=$(grep "^$today" "$MANUAL_LOG" | head -1 | cut -d'-' -f2- | xargs)
+    fi
+    
+    # Check today's workout - synced file
+    if [ -f "$SYNCED_FILE" ] && grep -q "^$today" "$SYNCED_FILE" 2>/dev/null; then
+        worked_out=true
+        local line=$(grep "^$today" "$SYNCED_FILE" | head -1)
+        local type=$(echo "$line" | cut -d'|' -f2)
+        local duration=$(echo "$line" | cut -d'|' -f3)
+        workout_info="$type - $duration"
+    fi
+    
+    if [ "$worked_out" = true ]; then
+        if [ -n "$workout_info" ]; then
+            echo -e "Today:     ${GREEN}${MUSCLE} WORKED OUT${NC} - ${BLUE}$workout_info${NC}"
+        else
+            echo -e "Today:     ${GREEN}${MUSCLE} WORKED OUT${NC}"
+        fi
+    else
+        echo -e "Today:     ${RED}${NO_ENTRY} NOT YET${NC}"
+    fi
+    
+    # Calculate streak - count today if worked out
+    if [ "$worked_out" = true ]; then
+        streak=1
+        # Try to count previous days (best effort)
+        for days_back in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+            local check_date
+            # macOS
+            check_date=$(date -j -v-${days_back}d +%Y-%m-%d 2>/dev/null) || \
+            # Linux
+            check_date=$(date -d "$days_back days ago" +%Y-%m-%d 2>/dev/null) || break
+            
+            local found=false
+            if grep -q "^$check_date" "$MANUAL_LOG" 2>/dev/null && ! grep -q "^$check_date.*SKIPPED" "$MANUAL_LOG" 2>/dev/null; then
+                found=true
+            fi
+            if [ -f "$SYNCED_FILE" ] && grep -q "^$check_date" "$SYNCED_FILE" 2>/dev/null; then
+                found=true
+            fi
+            
+            if [ "$found" = true ]; then
+                ((streak++))
+            else
+                break
+            fi
+        done
+    fi
+    
+    echo -e "Streak:    ${FIRE} $streak day(s)"
+    
+    # Check sync status
+    if [ -L "$SYNCED_FILE" ] || [ -f "$SYNCED_FILE" ]; then
+        if [ -f "$SYNCED_FILE" ]; then
+            local workout_count=$(wc -l < "$SYNCED_FILE" 2>/dev/null | xargs)
+            echo -e "Synced:    ${GREEN}$workout_count entries from Apple Fitness${NC}"
+        else
+            echo -e "Synced:    ${YELLOW}Link broken (run: gym-gate link-icloud)${NC}"
+        fi
+    else
+        echo -e "Synced:    ${YELLOW}Not linked (run: gym-gate link-icloud)${NC}"
+    fi
+    
+    echo ""
+    
+    # Show recent activity
+    echo -e "${BOLD}Recent Activity${NC}"
+    echo -e "─────────────────────────────────"
+    
+    local has_activity=false
+    
+    # Show from synced file first
+    if [ -f "$SYNCED_FILE" ] && [ -s "$SYNCED_FILE" ]; then
+        head -7 "$SYNCED_FILE" | while IFS='|' read -r date type duration; do
+            if [ -n "$date" ]; then
+                echo -e "  ${GREEN}✓${NC} $date - $type ($duration)"
+            fi
+        done
+        has_activity=true
+    fi
+    
+    # Show from manual log
+    if [ -f "$MANUAL_LOG" ] && [ -s "$MANUAL_LOG" ]; then
+        echo ""
+        echo -e "${BOLD}Manual Log${NC}"
+        echo -e "─────────────────────────────────"
+        tail -5 "$MANUAL_LOG" | while read line; do
+            if [[ "$line" == *"SKIPPED"* ]]; then
+                echo -e "  ${RED}✗${NC} $line"
+            else
+                echo -e "  ${GREEN}✓${NC} $line"
+            fi
+        done
+        has_activity=true
+    fi
+    
+    if [ "$has_activity" = false ]; then
+        echo -e "  ${YELLOW}No workouts logged yet${NC}"
+        echo ""
+        echo "  Get started:"
+        echo -e "    ${BLUE}gym-gate setup-health${NC}  - Set up Apple Health sync"
+        echo -e "    ${BLUE}gym-gate log \"workout\"${NC} - Log manually"
+    fi
+    
+    echo ""
+}
+
+setup_health() {
+    echo ""
+    echo -e "${BOLD}${MUSCLE} Apple Health Integration Setup${NC}"
+    echo -e "════════════════════════════════════════════════════════════"
+    echo ""
+    echo "gym-gate syncs with Apple Health's Exercise Minutes via an iOS Shortcut."
+    echo "Exercise Minutes tracks elevated heart rate activity - so casual walking"
+    echo "won't count, but gym sessions, runs, and intense workouts will."
+    echo ""
+    echo -e "${BOLD}Quick Summary:${NC}"
+    echo "─────────────────────────────────"
+    echo "1. Create an iOS Shortcut that:"
+    echo "   • Finds today's Exercise Minutes from Health"
+    echo "   • Calculates the total"
+    echo "   • If total > $(get_threshold) minutes, saves to iCloud Drive"
+    echo ""
+    echo "2. Set up automation to run the shortcut (daily or after workouts)"
+    echo ""
+    echo "3. Run: gym-gate link-icloud"
+    echo ""
+    echo -e "${BOLD}Detailed Instructions:${NC}"
+    echo "─────────────────────────────────"
+    echo "See the full step-by-step guide:"
+    echo -e "  ${BLUE}https://github.com/yourusername/gym-gate/blob/main/APPLE_HEALTH_SETUP.md${NC}"
+    echo ""
+    echo "Or if you have the repo locally, check APPLE_HEALTH_SETUP.md"
+    echo ""
+    echo -e "${BOLD}iOS Shortcut Structure:${NC}"
+    echo "─────────────────────────────────"
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────┐"
+    echo "  │ Find Health Samples                                     │"
+    echo "  │   Type: Exercise Minutes                                │"
+    echo "  │   Start Date: is today                                  │"
+    echo "  ├─────────────────────────────────────────────────────────┤"
+    echo "  │ Calculate Statistics: Sum                               │"
+    echo "  ├─────────────────────────────────────────────────────────┤"
+    echo "  │ If Result > $(get_threshold)                                          │"
+    echo "  │   ├─ Format Date (yyyy-MM-dd)                           │"
+    echo "  │   ├─ Text: [Date]|Exercise|[Minutes] min                │"
+    echo "  │   └─ Save to: /Shortcuts/gym-gate/workouts.txt          │"
+    echo "  │ Otherwise                                               │"
+    echo "  │   └─ Show Notification (not enough exercise)            │"
+    echo "  └─────────────────────────────────────────────────────────┘"
+    echo ""
+    echo -e "${YELLOW}For now, you can manually log workouts:${NC}"
+    echo -e "  ${GREEN}gym-gate log \"your workout description\"${NC}"
+    echo ""
+}
+
+link_icloud() {
+    ensure_config_dir
+    
+    local icloud_path="$HOME/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/gym-gate/workouts.txt"
+    
+    echo ""
+    echo -e "${BOLD}Linking iCloud Drive sync file...${NC}"
+    echo ""
+    
+    if [ -f "$icloud_path" ]; then
+        ln -sf "$icloud_path" "$SYNCED_FILE"
+        echo -e "${CHECK} ${GREEN}Linked to iCloud Drive!${NC}"
+        echo ""
+        echo -e "Source: ${BLUE}$icloud_path${NC}"
+        echo ""
+        
+        # Show recent synced workouts
+        echo -e "${BOLD}Recent synced workouts:${NC}"
+        head -5 "$icloud_path" 2>/dev/null | while IFS='|' read -r date type duration; do
+            if [ -n "$date" ]; then
+                echo -e "  ${GREEN}✓${NC} $date - $type ($duration)"
+            fi
+        done
+        echo ""
+        echo -e "${GREEN}You're all set!${NC} Workouts will sync automatically."
+        echo ""
+    else
+        echo -e "${YELLOW}iCloud file not found at:${NC}"
+        echo -e "  $icloud_path"
+        echo ""
+        echo "Make sure you've:"
+        echo "  1. Created the iOS Shortcut (see: gym-gate setup-health)"
+        echo "  2. Run the shortcut at least once on your iPhone"
+        echo "  3. Waited for iCloud to sync (can take a minute)"
+        echo ""
+        echo "Expected path in Files app:"
+        echo "  iCloud Drive → Shortcuts → gym-gate → workouts.txt"
+        echo ""
+        echo "To force iCloud refresh, try:"
+        echo -e "  ${BLUE}killall bird${NC}"
+        echo ""
+    fi
+}
+
+sync_status() {
+    ensure_config_dir
+    
+    local icloud_path="$HOME/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/gym-gate/workouts.txt"
+    local today=$(date +%Y-%m-%d)
+    
+    echo ""
+    echo -e "${BOLD}Sync Status${NC}"
+    echo -e "─────────────────────────────────"
+    
+    # Check if link exists
+    if [ -L "$SYNCED_FILE" ]; then
+        echo -e "Symlink:     ${GREEN}Configured${NC}"
+    else
+        echo -e "Symlink:     ${YELLOW}Not set up (run: gym-gate link-icloud)${NC}"
+    fi
+    
+    # Check iCloud file
+    if [ -f "$icloud_path" ]; then
+        # Get modification time
+        local mod_time
+        mod_time=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$icloud_path" 2>/dev/null) || \
+        mod_time=$(stat -c "%y" "$icloud_path" 2>/dev/null | cut -d'.' -f1) || \
+        mod_time="unknown"
+        
+        echo -e "iCloud file: ${GREEN}Found${NC}"
+        echo -e "Last sync:   ${BLUE}$mod_time${NC}"
+        
+        # Check if today is in the file
+        if grep -q "^$today" "$icloud_path" 2>/dev/null; then
+            local line=$(grep "^$today" "$icloud_path" | head -1)
+            local duration=$(echo "$line" | cut -d'|' -f3)
+            echo -e "Today:       ${GREEN}✓ Synced ($duration)${NC}"
+        else
+            echo -e "Today:       ${YELLOW}Not yet synced${NC}"
+        fi
+        
+        echo ""
+        echo -e "${BOLD}Recent entries:${NC}"
+        head -7 "$icloud_path" 2>/dev/null | while IFS='|' read -r date type duration; do
+            if [ -n "$date" ]; then
+                if [ "$date" = "$today" ]; then
+                    echo -e "  ${GREEN}★${NC} $date - $type ($duration) ${GREEN}← today${NC}"
+                else
+                    echo -e "  ${GREEN}•${NC} $date - $type ($duration)"
+                fi
+            fi
+        done
+    else
+        echo -e "iCloud file: ${RED}Not found${NC}"
+        echo ""
+        echo "The iOS Shortcut hasn't created the file yet."
+        echo "Run the shortcut on your iPhone to sync."
+    fi
+    
+    echo ""
+}
+
+disable_gate() {
+    ensure_config_dir
+    touch "$CONFIG_DIR/disabled"
+    echo ""
+    echo -e "${YELLOW}Gym-gate disabled.${NC}"
+    echo "Commits will be allowed without workout verification."
+    echo ""
+    echo -e "To re-enable: ${BLUE}gym-gate enable${NC}"
+    echo ""
+}
+
+enable_gate() {
+    rm -f "$CONFIG_DIR/disabled"
+    echo ""
+    echo -e "${GREEN}Gym-gate enabled!${NC} ${MUSCLE}"
+    echo "Commits now require workout verification."
+    echo ""
+}
+
+bypass_once() {
+    ensure_config_dir
+    
+    local hours="${1:-1}"
+    
+    # Validate hours is a number
+    if ! [[ "$hours" =~ ^[0-9]+$ ]]; then
+        hours=1
+    fi
+    
+    local seconds=$((hours * 3600))
+    local bypass_until=$(($(date +%s) + seconds))
+    echo "$bypass_until" > "$CONFIG_DIR/bypass"
+    
+    echo ""
+    echo -e "${YELLOW}${CALENDAR} Rest day mode activated!${NC}"
+    echo -e "   Gym-gate bypassed for ${CYAN}$hours hour(s)${NC}"
+    echo ""
+    echo "Enjoy your rest. You've earned it! 🧘"
+    echo ""
+}
+
+show_help() {
+    print_banner
+    echo "USAGE:"
+    echo "  gym-gate <command> [options]"
+    echo ""
+    echo "COMMANDS:"
+    echo "  install           Install gym-gate as a global git hook"
+    echo "  uninstall         Remove gym-gate from git hooks"
+    echo "  status            Show current status and streak"
+    echo ""
+    echo "  log <desc>        Log a workout manually"
+    echo "                    Example: gym-gate log \"30 min run\""
+    echo ""
+    echo "  set-threshold <n> Set minimum exercise minutes required"
+    echo "                    Example: gym-gate set-threshold 20"
+    echo ""
+    echo "  setup-health      Show iOS Shortcut setup instructions"
+    echo "  link-icloud       Link to iCloud Drive sync file"
+    echo "  sync              Show Apple Health sync status"
+    echo ""
+    echo "  enable            Enable gym-gate"
+    echo "  disable           Disable gym-gate (allow all commits)"
+    echo "  bypass [hours]    Rest day - skip for N hours (default: 1)"
+    echo ""
+    echo "  help              Show this help message"
+    echo "  version           Show version number"
+    echo ""
+    echo "EXAMPLES:"
+    echo "  gym-gate install              # Set up global hook"
+    echo "  gym-gate log \"Morning run\"    # Log today's workout"
+    echo "  gym-gate status               # Check your streak"
+    echo "  gym-gate set-threshold 30     # Require 30 min exercise"
+    echo "  gym-gate bypass 2             # Skip for 2 hours (rest day)"
+    echo ""
+}
+
+# Main command handler
+case "${1:-}" in
+    install)
+        print_banner
+        install_hooks
+        ;;
+    uninstall)
+        print_banner
+        uninstall_hooks
+        ;;
+    log)
+        shift
+        log_workout "$@"
+        ;;
+    status)
+        show_status
+        ;;
+    set-threshold)
+        shift
+        set_threshold "$@"
+        ;;
+    setup-health|setup)
+        setup_health
+        ;;
+    link-icloud)
+        link_icloud
+        ;;
+    sync)
+        sync_status
+        ;;
+    enable)
+        enable_gate
+        ;;
+    disable)
+        disable_gate
+        ;;
+    bypass|rest)
+        shift
+        bypass_once "$@"
+        ;;
+    help|--help|-h)
+        show_help
+        ;;
+    version|--version|-v)
+        echo "gym-gate v${VERSION}"
+        ;;
+    "")
+        show_help
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        echo "Run 'gym-gate help' for usage."
+        exit 1
+        ;;
+esac
