@@ -95,10 +95,6 @@ MIT - Do whatever you want. Just work out. 💪
 
 ### In Action
 
-```
-![In Action](./assets/successful-commit.png)
-```
+![Successful Commit](./assets/successful-commit.png)
 
-```
-![In Action](./assets/failed.png)
-```
+![Failed Commit](./assets/failed.png)
