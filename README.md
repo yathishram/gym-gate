@@ -50,6 +50,7 @@ gym-gate enable               # Turn on
 gym-gate syncs with **Exercise Minutes** (elevated heart rate activity).
 
 1. Create an iOS Shortcut:
+
    - Find Health Samples → Exercise Minutes → today
    - Calculate Statistics → Sum
    - If Sum > 15 → Save to `/Shortcuts/gym-gate/workouts.txt`
@@ -89,3 +90,15 @@ gym-gate syncs with **Exercise Minutes** (elevated heart rate activity).
 ## License
 
 MIT - Do whatever you want. Just work out. 💪
+
+---
+
+### In Action
+
+```
+![In Action](./assets/successful-commit.png)
+```
+
+```
+![In Action](./assets/failed.png)
+```
